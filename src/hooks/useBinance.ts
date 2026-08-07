@@ -9,13 +9,14 @@ export function useBinance(pair: Pair, timeframe: Timeframe) {
   const [currentPrice, setCurrentPrice] = useState<number | null>(null);
   const [isConnected, setIsConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
   // Fetch initial klines
   const fetchKlines = useCallback(async () => {
     try {
       const response = await fetch(`${REST_URL}?symbol=${pair}&interval=${timeframe}&limit=300`);
       const data = await response.json();
-      
+
       if (Array.isArray(data)) {
         const formattedCandles: Candle[] = data.map((d: any) => ({
           time: Math.floor(d[0] / 1000), // to seconds
@@ -37,54 +38,86 @@ export function useBinance(pair: Pair, timeframe: Timeframe) {
   useEffect(() => {
     fetchKlines();
 
-    // WebSocket logic
-    const streamName = `${pair.toLowerCase()}@kline_${timeframe}`;
-    const ws = new WebSocket(`${WS_URL}/${streamName}`);
-    wsRef.current = ws;
+    let isMounted = true;
 
-    ws.onopen = () => {
-      setIsConnected(true);
+    // WebSocket logic with Auto-Reconnect
+    const connectWs = () => {
+      if (!isMounted) return;
+      
+      const streamName = `${pair.toLowerCase()}@kline_${timeframe}`;
+      const ws = new WebSocket(`${WS_URL}/${streamName}`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        if (!isMounted) return;
+        setIsConnected(true);
+        if (reconnectTimeoutRef.current) {
+          clearTimeout(reconnectTimeoutRef.current);
+          reconnectTimeoutRef.current = null;
+        }
+      };
+
+      ws.onmessage = (event) => {
+        if (!isMounted) return;
+        const data = JSON.parse(event.data);
+        if (data.e === 'kline') {
+          const k = data.k;
+          const newCandle: Candle = {
+            time: Math.floor(k.t / 1000),
+            open: parseFloat(k.o),
+            high: parseFloat(k.h),
+            low: parseFloat(k.l),
+            close: parseFloat(k.c),
+            volume: parseFloat(k.v),
+            isClosed: k.x
+          };
+
+          setCurrentPrice(newCandle.close);
+
+          setCandles(prev => {
+            if (prev.length === 0) return [newCandle];
+            const lastCandle = prev[prev.length - 1];
+
+            if (newCandle.time === lastCandle.time) {
+              const updated = [...prev];
+              updated[updated.length - 1] = newCandle;
+              return updated;
+            } else if (newCandle.time > lastCandle.time) {
+              return [...prev.slice(1), newCandle];
+            }
+            return prev;
+          });
+        }
+      };
+
+      ws.onerror = () => {
+        if (!isMounted) return;
+        setIsConnected(false);
+        ws.close();
+      };
+
+      ws.onclose = () => {
+        if (!isMounted) return;
+        setIsConnected(false);
+        // إعادة الاتصال تلقائياً بعد 3 ثوانٍ لو حصل أي انقطاع
+        if (!reconnectTimeoutRef.current) {
+          reconnectTimeoutRef.current = setTimeout(() => {
+            connectWs();
+          }, 3000);
+        }
+      };
     };
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.e === 'kline') {
-        const k = data.k;
-        const newCandle: Candle = {
-          time: Math.floor(k.t / 1000),
-          open: parseFloat(k.o),
-          high: parseFloat(k.h),
-          low: parseFloat(k.l),
-          close: parseFloat(k.c),
-          volume: parseFloat(k.v),
-          isClosed: k.x
-        };
-
-        setCurrentPrice(newCandle.close);
-
-        setCandles(prev => {
-          if (prev.length === 0) return [newCandle];
-          const lastCandle = prev[prev.length - 1];
-          
-          if (newCandle.time === lastCandle.time) {
-            // Update current forming candle
-            const updated = [...prev];
-            updated[updated.length - 1] = newCandle;
-            return updated;
-          } else if (newCandle.time > lastCandle.time) {
-            // New candle started
-            return [...prev.slice(1), newCandle]; // keep array size manageable
-          }
-          return prev;
-        });
-      }
-    };
-
-    ws.onerror = () => setIsConnected(false);
-    ws.onclose = () => setIsConnected(false);
+    connectWs();
 
     return () => {
-      ws.close();
+      isMounted = false;
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
     };
   }, [pair, timeframe, fetchKlines]);
 
